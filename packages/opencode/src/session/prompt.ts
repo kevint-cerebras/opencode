@@ -18,6 +18,8 @@ import { SystemPrompt } from "./system"
 import { InstructionPrompt } from "./instruction"
 import { Plugin } from "../plugin"
 import PROMPT_PLAN from "../session/prompt/plan.txt"
+import PROMPT_RALPH from "../session/prompt/ralph.txt"
+import RALPH_CONTINUE from "../session/prompt/ralph-continue.txt"
 import BUILD_SWITCH from "../session/prompt/build-switch.txt"
 import MAX_STEPS from "../session/prompt/max-steps.txt"
 import { defer } from "../util/defer"
@@ -277,6 +279,8 @@ export namespace SessionPrompt {
     using _ = defer(() => cancel(sessionID))
 
     let step = 0
+    let ralphDone = false
+    let ralphIteration = 0
     const session = await Session.get(sessionID)
     while (true) {
       SessionStatus.set(sessionID, { type: "busy" })
@@ -302,11 +306,47 @@ export namespace SessionPrompt {
       }
 
       if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
+
+      // Detect ralph loop completion from assistant parts
+      if (lastUser.agent === "ralph" && lastAssistant && !ralphDone) {
+        const assistantMsg = msgs.find((m) => m.info.id === lastAssistant!.id)
+        if (assistantMsg?.parts.some((p) => p.type === "tool" && p.tool === "loopcomplete")) {
+          ralphDone = true
+        }
+      }
+
       if (
         lastAssistant?.finish &&
         !["tool-calls", "unknown"].includes(lastAssistant.finish) &&
         lastUser.id < lastAssistant.id
       ) {
+        // Ralph loop continuation: re-prompt the agent if not done
+        const maxRalphIterations = 25
+        if (lastUser.agent === "ralph" && !ralphDone && ralphIteration < maxRalphIterations) {
+          ralphIteration++
+          log.info("ralph loop continuing", {
+            iteration: ralphIteration,
+            max: maxRalphIterations,
+          })
+          const continueMsg: MessageV2.User = {
+            id: Identifier.ascending("message"),
+            sessionID,
+            role: "user",
+            time: { created: Date.now() },
+            agent: lastUser.agent,
+            model: lastUser.model,
+          }
+          await Session.updateMessage(continueMsg)
+          await Session.updatePart({
+            type: "text",
+            id: Identifier.ascending("part"),
+            messageID: continueMsg.id,
+            sessionID,
+            text: RALPH_CONTINUE,
+            synthetic: true,
+          })
+          continue
+        }
         log.info("exiting loop", { sessionID })
         break
       }
@@ -1234,6 +1274,17 @@ export namespace SessionPrompt {
   async function insertReminders(input: { messages: MessageV2.WithParts[]; agent: Agent.Info; session: Session.Info }) {
     const userMessage = input.messages.findLast((msg) => msg.info.role === "user")
     if (!userMessage) return input.messages
+
+    if (input.agent.name === "ralph") {
+      userMessage.parts.push({
+        id: Identifier.ascending("part"),
+        messageID: userMessage.info.id,
+        sessionID: userMessage.info.sessionID,
+        type: "text",
+        text: PROMPT_RALPH,
+        synthetic: true,
+      })
+    }
 
     // Original logic when experimental plan mode is disabled
     if (!Flag.OPENCODE_EXPERIMENTAL_PLAN_MODE) {
