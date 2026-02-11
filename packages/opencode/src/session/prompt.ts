@@ -281,7 +281,8 @@ export namespace SessionPrompt {
 
     let step = 0
     let ralphDone = false
-    let ralphIteration = 0
+    const maxRalphIterations = 25
+    const maxRalphSteps = 200
     const session = await Session.get(sessionID)
     while (true) {
       SessionStatus.set(sessionID, { type: "busy" })
@@ -308,6 +309,12 @@ export namespace SessionPrompt {
 
       if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
 
+      // Hard safety cap on total LLM calls for ralph mode
+      if (lastUser.agent === "ralph" && step >= maxRalphSteps) {
+        log.info("ralph hard step limit reached", { step, max: maxRalphSteps })
+        break
+      }
+
       // Detect ralph loop completion from assistant parts
       if (lastUser.agent === "ralph" && lastAssistant && !ralphDone) {
         const assistantMsg = msgs.find((m) => m.info.id === lastAssistant!.id)
@@ -321,15 +328,35 @@ export namespace SessionPrompt {
         !["tool-calls", "unknown"].includes(lastAssistant.finish) &&
         lastUser.id < lastAssistant.id
       ) {
-        // Ralph loop continuation: only auto-continue once a plan exists (todos written)
+        // Ralph loop continuation
         if (lastUser.agent === "ralph" && !ralphDone) {
-          const todos = await Todo.get(sessionID)
-          const hasPlan = todos.length > 0
-          const maxRalphIterations = 25
-          if (hasPlan && ralphIteration < maxRalphIterations) {
-            ralphIteration++
+          // Count ralph continues since the last real (non-synthetic) user message.
+          // Naturally resets when the user sends a new message after a loop ends.
+          let lastRealIdx = -1
+          for (let i = msgs.length - 1; i >= 0; i--) {
+            if (
+              msgs[i].info.role === "user" &&
+              !msgs[i].parts.every((p) => "synthetic" in p && p.synthetic)
+            ) {
+              lastRealIdx = i
+              break
+            }
+          }
+          const ralphIteration = msgs
+            .slice(lastRealIdx + 1)
+            .filter(
+              (m) =>
+                m.info.role === "user" &&
+                m.parts.some(
+                  (p) =>
+                    p.type === "text" &&
+                    "metadata" in p &&
+                    (p as MessageV2.TextPart).metadata?.source === "ralph-continue",
+                ),
+            ).length
+          if (ralphIteration < maxRalphIterations) {
             log.info("ralph loop continuing", {
-              iteration: ralphIteration,
+              iteration: ralphIteration + 1,
               max: maxRalphIterations,
             })
             const continueMsg: MessageV2.User = {
@@ -348,11 +375,9 @@ export namespace SessionPrompt {
               sessionID,
               text: RALPH_CONTINUE,
               synthetic: true,
+              metadata: { source: "ralph-continue" },
             })
             continue
-          }
-          if (!hasPlan) {
-            log.info("ralph planning phase, waiting for user", { sessionID })
           }
         }
         log.info("exiting loop", { sessionID })
@@ -644,7 +669,52 @@ export namespace SessionPrompt {
         })
       }
 
-      const sessionMessages = clone(msgs)
+      let sessionMessages = clone(msgs)
+
+      // Ralph: always strip message history to current turn only, inject context from files.
+      // This prevents context bloat on ALL ralph turns — first message, tool-call
+      // continuations, and synthetic continues alike.
+      if (lastUser.agent === "ralph") {
+        const turnStart = sessionMessages.findLastIndex((m) => m.info.role === "user")
+        if (turnStart > 0) {
+          sessionMessages = sessionMessages.slice(turnStart)
+        }
+
+        // Inject CWD, plan, progress log, and task list so the model has context without history
+        const lastUserMsg = sessionMessages.find((m) => m.info.role === "user")
+        if (lastUserMsg) {
+          const planPath = path.join(Instance.worktree, ".opencode/plans/ralph-plan.md")
+          const progressPath = path.join(Instance.worktree, ".opencode/plans/progress.txt")
+          const planContent = await Bun.file(planPath)
+            .text()
+            .catch(() => "")
+          const progressContent = await Bun.file(progressPath)
+            .text()
+            .catch(() => "")
+          const todos = await Todo.get(sessionID)
+          const todoList = todos.length > 0
+            ? todos.map((t) => `- [${t.status}] ${t.content}`).join("\n")
+            : ""
+
+          const parts = [
+            `## CWD\n${Instance.directory}`,
+            planContent ? `## Plan\n${planContent}` : "",
+            progressContent ? `## Progress\n${progressContent}` : "",
+            todoList ? `## Tasks\n${todoList}` : "",
+          ].filter(Boolean)
+
+          if (parts.length > 0) {
+            lastUserMsg.parts.push({
+              id: Identifier.ascending("part"),
+              messageID: lastUserMsg.info.id,
+              sessionID,
+              type: "text",
+              text: parts.join("\n\n"),
+              synthetic: true,
+            })
+          }
+        }
+      }
 
       // Ephemerally wrap queued user messages with a reminder to stay on track
       if (step > 1 && lastFinished) {

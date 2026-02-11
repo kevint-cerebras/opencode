@@ -28,29 +28,81 @@ export function Sidebar(props: { sessionID: string; overlay?: boolean }) {
     lsp: true,
   })
 
-  // Extract plan-like content from the latest assistant message
-  const plan = createMemo(() => {
+  // Detect ralph mode and compute iteration/plan info
+  const ralph = createMemo(() => {
     const msgs = messages()
+    // Check if the current (most recent) agent is ralph, not just any historical message
+    const lastMsg = msgs.findLast((m) => m.role === "assistant")
+    if (!lastMsg || (lastMsg.agent !== "ralph" && (lastMsg as AssistantMessage).mode !== "ralph")) return undefined
+
+    let planSummary: string | undefined
+    let iteration = 0
+
+    // Find last real (non-synthetic) user message — iteration count resets from here
+    let lastRealIdx = -1
     for (let i = msgs.length - 1; i >= 0; i--) {
-      const msg = msgs[i]
-      if (msg.role !== "assistant") continue
-      const parts = sync.data.part[msg.id] ?? []
-      for (let j = parts.length - 1; j >= 0; j--) {
-        const part = parts[j]
-        if (part.type === "tool" && part.tool === "todowrite" && "status" in part.state && part.state.status === "completed") {
-          return undefined
-        }
-        if (part.type === "text" && part.text) {
-          const text = part.text
-          // Look for plan-like sections in the response
-          const planMatch = text.match(/(?:^|\n)(?:#{1,3}\s*)?(?:Plan|Steps|Approach|Strategy)[:\s]*\n([\s\S]*?)(?:\n#{1,3}\s|\n---|\n\*\*[A-Z]|$)/i)
-          if (planMatch) return planMatch[1].trim()
-          // If the message is from plan mode, use the full text
-          if (msg.agent === "plan" || msg.mode === "plan") return text.trim()
+      if (msgs[i].role === "user") {
+        const parts = sync.data.part[msgs[i].id] ?? []
+        if (!parts.every((p: any) => p.type === "text" && p.synthetic)) {
+          lastRealIdx = i
+          break
         }
       }
     }
-    return undefined
+
+    for (let i = 0; i < msgs.length; i++) {
+      const msg = msgs[i]
+
+      // Plan summary: scan all assistant messages (show latest plan)
+      if (msg.role === "assistant" && (msg.agent === "ralph" || msg.mode === "ralph")) {
+        const parts = sync.data.part[msg.id] ?? []
+        for (const part of parts) {
+          const p = part as any
+          if (
+            p.type === "tool" &&
+            p.tool === "write" &&
+            p.state?.status === "completed" &&
+            p.state?.input?.filePath?.includes("ralph-plan")
+          ) {
+            const content = p.state.input?.content as string | undefined
+            if (content) {
+              const bullets: string[] = []
+              for (const raw of content.split("\n")) {
+                const line = raw.trim()
+                if (!line) continue
+                if (line.startsWith("# ")) continue
+                if (line.startsWith("## ") || line.startsWith("### ")) {
+                  bullets.push(`[${line.replace(/^#{2,3}\s*/, "")}]`)
+                  continue
+                }
+                if (line.startsWith("- ") || line.startsWith("* ") || /^\d+\.\s/.test(line)) {
+                  bullets.push(`  ${line.replace(/^[-*]\s+|^\d+\.\s+/, "")}`)
+                  continue
+                }
+                if (line.length <= 120) {
+                  bullets.push(`  ${line}`)
+                }
+              }
+              planSummary = bullets.slice(0, 30).join("\n")
+            }
+          }
+        }
+      }
+
+      // Count ralph-continue synthetic messages in the current loop only
+      if (i > lastRealIdx && msg.role === "user") {
+        const parts = sync.data.part[msg.id] ?? []
+        if (parts.some((p: any) => p.type === "text" && p.metadata?.source === "ralph-continue")) {
+          iteration++
+        }
+      }
+    }
+
+    return {
+      iteration,
+      maxIterations: 25,
+      plan: planSummary,
+    }
   })
 
   // Sort MCP servers alphabetically for consistent display order
@@ -116,6 +168,16 @@ export function Sidebar(props: { sessionID: string; overlay?: boolean }) {
                 <text fg={theme.textMuted}>{session().share!.url}</text>
               </Show>
             </box>
+            <Show when={ralph()}>
+              <box>
+                <text fg={theme.text}>
+                  <b>Ralph</b>{" "}
+                  <span style={{ fg: theme.success }}>
+                    {`Iteration ${ralph()!.iteration}/${ralph()!.maxIterations}`}
+                  </span>
+                </text>
+              </box>
+            </Show>
             <Show when={todo().length > 0 && todo().some((t) => t.status !== "completed")}>
               <box>
                 <box
@@ -138,7 +200,7 @@ export function Sidebar(props: { sessionID: string; overlay?: boolean }) {
                 </Show>
               </box>
             </Show>
-            <Show when={plan()}>
+            <Show when={ralph()?.plan}>
               <box>
                 <box
                   flexDirection="row"
@@ -151,9 +213,16 @@ export function Sidebar(props: { sessionID: string; overlay?: boolean }) {
                   </text>
                 </box>
                 <Show when={expanded.plan}>
-                  <text fg={theme.textMuted} wrapMode="word">
-                    {plan()!.length > 500 ? plan()!.slice(0, 497) + "..." : plan()}
-                  </text>
+                  <For each={ralph()!.plan!.split("\n")}>
+                    {(line) => (
+                      <text
+                        fg={line.startsWith("[") ? theme.text : theme.textMuted}
+                        wrapMode="word"
+                      >
+                        {line.startsWith("[") ? <b>{line.slice(1, -1)}</b> : `• ${line.trim()}`}
+                      </text>
+                    )}
+                  </For>
                 </Show>
               </box>
             </Show>

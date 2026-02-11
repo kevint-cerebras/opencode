@@ -1,1 +1,3 @@
-Continue executing the plan. Review your todo list, assess what remains, update task statuses, and take the next step. If all tasks are complete and verified, call the `loopcomplete` tool with a summary. Otherwise, keep working.
+You are starting a new iteration of Ralph mode. Your plan, progress log, and current task list are provided below. You do NOT have access to previous iteration history — rely on these artifacts and files on disk to understand current state.
+
+Review the tasks, determine what needs to be done next, and take action. Read files to re-establish context when needed. Update `.opencode/plans/progress.txt` with any new discoveries or changes. If all tasks are complete and verified, call `loopcomplete` with a summary.
