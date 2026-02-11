@@ -1,1 +1,1 @@
-Continue iterating on the task. Review what you have accomplished so far, assess what remains, and take the next step. If the task is fully complete and verified, call the `loopcomplete` tool with a summary. Otherwise, keep working.
+Continue executing the plan. Review your todo list, assess what remains, update task statuses, and take the next step. If all tasks are complete and verified, call the `loopcomplete` tool with a summary. Otherwise, keep working.

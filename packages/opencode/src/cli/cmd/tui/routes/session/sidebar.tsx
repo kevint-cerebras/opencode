@@ -24,7 +24,33 @@ export function Sidebar(props: { sessionID: string; overlay?: boolean }) {
     mcp: true,
     diff: true,
     todo: true,
+    plan: true,
     lsp: true,
+  })
+
+  // Extract plan-like content from the latest assistant message
+  const plan = createMemo(() => {
+    const msgs = messages()
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      const msg = msgs[i]
+      if (msg.role !== "assistant") continue
+      const parts = sync.data.part[msg.id] ?? []
+      for (let j = parts.length - 1; j >= 0; j--) {
+        const part = parts[j]
+        if (part.type === "tool" && part.tool === "todowrite" && "status" in part.state && part.state.status === "completed") {
+          return undefined
+        }
+        if (part.type === "text" && part.text) {
+          const text = part.text
+          // Look for plan-like sections in the response
+          const planMatch = text.match(/(?:^|\n)(?:#{1,3}\s*)?(?:Plan|Steps|Approach|Strategy)[:\s]*\n([\s\S]*?)(?:\n#{1,3}\s|\n---|\n\*\*[A-Z]|$)/i)
+          if (planMatch) return planMatch[1].trim()
+          // If the message is from plan mode, use the full text
+          if (msg.agent === "plan" || msg.mode === "plan") return text.trim()
+        }
+      }
+    }
+    return undefined
   })
 
   // Sort MCP servers alphabetically for consistent display order
@@ -90,6 +116,47 @@ export function Sidebar(props: { sessionID: string; overlay?: boolean }) {
                 <text fg={theme.textMuted}>{session().share!.url}</text>
               </Show>
             </box>
+            <Show when={todo().length > 0 && todo().some((t) => t.status !== "completed")}>
+              <box>
+                <box
+                  flexDirection="row"
+                  gap={1}
+                  onMouseDown={() => todo().length > 2 && setExpanded("todo", !expanded.todo)}
+                >
+                  <Show when={todo().length > 2}>
+                    <text fg={theme.text}>{expanded.todo ? "▼" : "▶"}</text>
+                  </Show>
+                  <text fg={theme.text}>
+                    <b>Tasks</b>{" "}
+                    <span style={{ fg: theme.textMuted }}>
+                      ({todo().filter((t) => t.status === "completed").length}/{todo().length})
+                    </span>
+                  </text>
+                </box>
+                <Show when={todo().length <= 2 || expanded.todo}>
+                  <For each={todo()}>{(todo) => <TodoItem status={todo.status} content={todo.content} />}</For>
+                </Show>
+              </box>
+            </Show>
+            <Show when={plan()}>
+              <box>
+                <box
+                  flexDirection="row"
+                  gap={1}
+                  onMouseDown={() => setExpanded("plan", !expanded.plan)}
+                >
+                  <text fg={theme.text}>{expanded.plan ? "▼" : "▶"}</text>
+                  <text fg={theme.text}>
+                    <b>Plan</b>
+                  </text>
+                </box>
+                <Show when={expanded.plan}>
+                  <text fg={theme.textMuted} wrapMode="word">
+                    {plan()!.length > 500 ? plan()!.slice(0, 497) + "..." : plan()}
+                  </text>
+                </Show>
+              </box>
+            </Show>
             <box>
               <text fg={theme.text}>
                 <b>Context</b>
@@ -202,25 +269,6 @@ export function Sidebar(props: { sessionID: string; overlay?: boolean }) {
                 </For>
               </Show>
             </box>
-            <Show when={todo().length > 0 && todo().some((t) => t.status !== "completed")}>
-              <box>
-                <box
-                  flexDirection="row"
-                  gap={1}
-                  onMouseDown={() => todo().length > 2 && setExpanded("todo", !expanded.todo)}
-                >
-                  <Show when={todo().length > 2}>
-                    <text fg={theme.text}>{expanded.todo ? "▼" : "▶"}</text>
-                  </Show>
-                  <text fg={theme.text}>
-                    <b>Todo</b>
-                  </text>
-                </box>
-                <Show when={todo().length <= 2 || expanded.todo}>
-                  <For each={todo()}>{(todo) => <TodoItem status={todo.status} content={todo.content} />}</For>
-                </Show>
-              </box>
-            </Show>
             <Show when={diff().length > 0}>
               <box>
                 <box
