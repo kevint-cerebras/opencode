@@ -49,6 +49,7 @@ import { iife } from "@/util/iife"
 import { Shell } from "@/shell/shell"
 import { Truncate } from "@/tool/truncation"
 import { Todo } from "./todo"
+import { Token } from "../util/token"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -721,6 +722,53 @@ export namespace SessionPrompt {
               text: parts.join("\n\n"),
               synthetic: true,
             })
+          }
+        }
+
+        // Enforce token budget: estimate total context and truncate old tool outputs
+        // if we're approaching the model's limit. The compaction overflow check (above)
+        // can't catch this because it runs before we inject plan/progress/todos.
+        const budget = model.limit.input
+          ? model.limit.input - ProviderTransform.maxOutputTokens(model)
+          : model.limit.context - ProviderTransform.maxOutputTokens(model)
+        if (budget > 0) {
+          let total = 0
+          for (const msg of sessionMessages) {
+            for (const part of msg.parts) {
+              if (part.type === "text") total += Token.estimate(part.text)
+              if (part.type === "tool" && part.state.status === "completed") {
+                total += Token.estimate(
+                  typeof part.state.output === "string"
+                    ? part.state.output
+                    : JSON.stringify(part.state.output),
+                )
+              }
+            }
+          }
+          // If over 80% of budget, truncate tool outputs from oldest to newest
+          if (total > budget * 0.8) {
+            log.info("ralph token budget exceeded, truncating tool outputs", {
+              estimated: total,
+              budget,
+            })
+            for (const msg of sessionMessages) {
+              if (total <= budget * 0.6) break
+              for (const part of msg.parts) {
+                if (total <= budget * 0.6) break
+                if (part.type === "tool" && part.state.status === "completed") {
+                  const output =
+                    typeof part.state.output === "string"
+                      ? part.state.output
+                      : JSON.stringify(part.state.output)
+                  const tokens = Token.estimate(output)
+                  if (tokens > 500) {
+                    const truncated = `[Output truncated - was ${tokens} tokens. Tool: ${part.tool}]`
+                    part.state.output = truncated
+                    total -= tokens - Token.estimate(truncated)
+                  }
+                }
+              }
+            }
           }
         }
       }
