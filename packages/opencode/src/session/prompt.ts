@@ -54,6 +54,16 @@ import { Token } from "../util/token"
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
 
+const STRUCTURED_OUTPUT_DESCRIPTION = `Use this tool to return your final response in the requested structured format.
+
+IMPORTANT:
+- You MUST call this tool exactly once at the end of your response
+- The input must be valid JSON matching the required schema
+- Complete all necessary research and tool calls BEFORE calling this tool
+- This tool provides your final answer - no further actions are taken after calling it`
+
+const STRUCTURED_OUTPUT_SYSTEM_PROMPT = `IMPORTANT: The user has requested structured output. You MUST use the StructuredOutput tool to provide your final response. Do NOT respond with plain text - you MUST call the StructuredOutput tool with your answer formatted according to the schema.`
+
 export namespace SessionPrompt {
   const log = Log.create({ service: "session.prompt" })
 
@@ -100,6 +110,7 @@ export namespace SessionPrompt {
       .describe(
         "@deprecated tools and permissions have been merged, you can set permissions on the session itself now",
       ),
+    format: MessageV2.Format.optional(),
     system: z.string().optional(),
     variant: z.string().optional(),
     parts: z.array(
@@ -279,6 +290,11 @@ export namespace SessionPrompt {
     }
 
     using _ = defer(() => cancel(sessionID))
+
+    // Structured output state
+    // Note: On session resumption, state is reset but outputFormat is preserved
+    // on the user message and will be retrieved from lastUser below
+    let structuredOutput: unknown | undefined
 
     let step = 0
     let ralphDone = false
@@ -521,6 +537,7 @@ export namespace SessionPrompt {
             tool: "task",
             sessionID,
             callID: part.id,
+            args: taskArgs,
           },
           result,
         )
@@ -672,6 +689,16 @@ export namespace SessionPrompt {
         messages: msgs,
       })
 
+      // Inject StructuredOutput tool if JSON schema mode enabled
+      if (lastUser.format?.type === "json_schema") {
+        tools["StructuredOutput"] = createStructuredOutputTool({
+          schema: lastUser.format.schema,
+          onSuccess(output) {
+            structuredOutput = output
+          },
+        })
+      }
+
       if (step === 1) {
         SessionSummary.summarize({
           sessionID: sessionID,
@@ -804,6 +831,13 @@ export namespace SessionPrompt {
 
       await Plugin.trigger("experimental.chat.messages.transform", {}, { messages: sessionMessages })
 
+      // Build system prompt, adding structured output instruction if needed
+      const system = [...(await SystemPrompt.environment(model)), ...(await InstructionPrompt.system())]
+      const format = lastUser.format ?? { type: "text" }
+      if (format.type === "json_schema") {
+        system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
+      }
+
       const result = await processor.process({
         user: lastUser,
         agent,
@@ -824,7 +858,33 @@ export namespace SessionPrompt {
         ],
         tools,
         model,
+        toolChoice: format.type === "json_schema" ? "required" : undefined,
       })
+
+      // If structured output was captured, save it and exit immediately
+      // This takes priority because the StructuredOutput tool was called successfully
+      if (structuredOutput !== undefined) {
+        processor.message.structured = structuredOutput
+        processor.message.finish = processor.message.finish ?? "stop"
+        await Session.updateMessage(processor.message)
+        break
+      }
+
+      // Check if model finished (finish reason is not "tool-calls" or "unknown")
+      const modelFinished = processor.message.finish && !["tool-calls", "unknown"].includes(processor.message.finish)
+
+      if (modelFinished && !processor.message.error) {
+        if (format.type === "json_schema") {
+          // Model stopped without calling StructuredOutput tool
+          processor.message.error = new MessageV2.StructuredOutputError({
+            message: "Model did not produce structured output",
+            retries: 0,
+          }).toObject()
+          await Session.updateMessage(processor.message)
+          break
+        }
+      }
+
       if (result === "stop") break
       if (result === "compact") {
         await SessionCompaction.create({
@@ -855,7 +915,8 @@ export namespace SessionPrompt {
     return Provider.defaultModel()
   }
 
-  async function resolveTools(input: {
+  /** @internal Exported for testing */
+  export async function resolveTools(input: {
     agent: Agent.Info
     model: Provider.Model
     session: Session.Info
@@ -931,6 +992,7 @@ export namespace SessionPrompt {
               tool: item.id,
               sessionID: ctx.sessionID,
               callID: ctx.callID,
+              args,
             },
             result,
           )
@@ -976,6 +1038,7 @@ export namespace SessionPrompt {
             tool: key,
             sessionID: ctx.sessionID,
             callID: opts.toolCallId,
+            args,
           },
           result,
         )
@@ -1035,6 +1098,36 @@ export namespace SessionPrompt {
     return tools
   }
 
+  /** @internal Exported for testing */
+  export function createStructuredOutputTool(input: {
+    schema: Record<string, any>
+    onSuccess: (output: unknown) => void
+  }): AITool {
+    // Remove $schema property if present (not needed for tool input)
+    const { $schema, ...toolSchema } = input.schema
+
+    return tool({
+      id: "StructuredOutput" as any,
+      description: STRUCTURED_OUTPUT_DESCRIPTION,
+      inputSchema: jsonSchema(toolSchema as any),
+      async execute(args) {
+        // AI SDK validates args against inputSchema before calling execute()
+        input.onSuccess(args)
+        return {
+          output: "Structured output captured successfully.",
+          title: "Structured Output",
+          metadata: { valid: true },
+        }
+      },
+      toModelOutput(result) {
+        return {
+          type: "text",
+          value: result.output,
+        }
+      },
+    })
+  }
+
   async function createUserMessage(input: PromptInput) {
     const agent = await Agent.get(input.agent ?? (await Agent.defaultAgent()))
 
@@ -1056,6 +1149,7 @@ export namespace SessionPrompt {
       agent: agent.name,
       model,
       system: input.system,
+      format: input.format,
       variant,
     }
     using _ = defer(() => InstructionPrompt.clear(info.id))

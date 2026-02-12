@@ -1,8 +1,10 @@
 import { render, useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/solid"
 import { Clipboard } from "@tui/util/clipboard"
-import { TextAttributes } from "@opentui/core"
+import { Selection } from "@tui/util/selection"
+import { MouseButton, TextAttributes } from "@opentui/core"
 import { RouteProvider, useRoute } from "@tui/context/route"
 import { Switch, Match, createEffect, untrack, ErrorBoundary, createSignal, onMount, batch, Show, on } from "solid-js"
+import { win32DisableProcessedInput, win32FlushInputBuffer, win32InstallCtrlCGuard } from "./win32"
 import { Installation } from "@/installation"
 import { Flag } from "@/flag/flag"
 import { DialogProvider, useDialog } from "@tui/ui/dialog"
@@ -113,8 +115,17 @@ export function tui(input: {
 }) {
   // promise to prevent immediate exit
   return new Promise<void>(async (resolve) => {
+    const unguard = win32InstallCtrlCGuard()
+    win32DisableProcessedInput()
+
     const mode = await getTerminalBackgroundColor()
+
+    // Re-clear after getTerminalBackgroundColor() — setRawMode(false) restores
+    // the original console mode which re-enables ENABLE_PROCESSED_INPUT.
+    win32DisableProcessedInput()
+
     const onExit = async () => {
+      unguard?.()
       await input.onExit?.()
       resolve()
     }
@@ -173,6 +184,7 @@ export function tui(input: {
         exitOnCtrlC: false,
         useKittyKeyboard: {},
         autoFocus: false,
+        openConsoleOnError: false,
         consoleOptions: {
           keyBindings: [{ name: "y", ctrl: true, action: "copy-selection" }],
           onCopySelection: (text) => {
@@ -202,6 +214,35 @@ function App() {
   const exit = useExit()
   const promptRef = usePromptRef()
 
+  useKeyboard((evt) => {
+    if (!Flag.OPENCODE_EXPERIMENTAL_DISABLE_COPY_ON_SELECT) return
+    if (!renderer.getSelection()) return
+
+    // Windows Terminal-like behavior:
+    // - Ctrl+C copies and dismisses selection
+    // - Esc dismisses selection
+    // - Most other key input dismisses selection and is passed through
+    if (evt.ctrl && evt.name === "c") {
+      if (!Selection.copy(renderer, toast)) {
+        renderer.clearSelection()
+        return
+      }
+
+      evt.preventDefault()
+      evt.stopPropagation()
+      return
+    }
+
+    if (evt.name === "escape") {
+      renderer.clearSelection()
+      evt.preventDefault()
+      evt.stopPropagation()
+      return
+    }
+
+    renderer.clearSelection()
+  })
+
   // Wire up console copy-to-clipboard via opentui's onCopySelection callback
   renderer.console.onCopySelection = async (text: string) => {
     if (!text || text.length === 0) return
@@ -209,6 +250,7 @@ function App() {
     await Clipboard.copy(text)
       .then(() => toast.show({ message: "Copied to clipboard", variant: "info" }))
       .catch(toast.error)
+
     renderer.clearSelection()
   }
   const [terminalTitleEnabled, setTerminalTitleEnabled] = createSignal(kv.get("terminal_title_enabled", true))
@@ -224,14 +266,14 @@ function App() {
     if (!terminalTitleEnabled() || Flag.OPENCODE_DISABLE_TERMINAL_TITLE) return
 
     if (route.data.type === "home") {
-      renderer.setTerminalTitle("OpenCode")
+      renderer.setTerminalTitle("Cerebras CLI")
       return
     }
 
     if (route.data.type === "session") {
       const session = sync.session.get(route.data.sessionID)
       if (!session || SessionApi.isDefaultTitle(session.title)) {
-        renderer.setTerminalTitle("OpenCode")
+        renderer.setTerminalTitle("Cerebras CLI")
         return
       }
 
@@ -587,7 +629,7 @@ function App() {
       title: "Open docs",
       value: "docs.open",
       onSelect: () => {
-        open("https://opencode.ai/docs").catch(() => {})
+        open("https://cloud.cerebras.ai").catch(() => {})
         dialog.clear()
       },
       category: "System",
@@ -694,7 +736,7 @@ function App() {
         DialogAlert.show(
           dialog,
           "Warning",
-          "While openrouter is a convenient way to access LLMs your request will often be routed to subpar providers that do not work well in our testing.\n\nFor reliable access to models check out OpenCode Zen\nhttps://opencode.ai/zen",
+          "While openrouter is a convenient way to access LLMs your request will often be routed to subpar providers that do not work well in our testing.\n\nFor reliable access to models check out Cerebras\nhttps://cloud.cerebras.ai",
         ).then(() => kv.set("openrouter_warning", true))
       })
     }
@@ -756,7 +798,7 @@ function App() {
     toast.show({
       variant: "info",
       title: "Update Available",
-      message: `OpenCode v${evt.properties.version} is available. Run 'opencode upgrade' to update manually.`,
+      message: `Cerebras CLI v${evt.properties.version} is available. Run 'cerebras-cli upgrade' to update manually.`,
       duration: 10000,
     })
   })
@@ -766,19 +808,15 @@ function App() {
       width={dimensions().width}
       height={dimensions().height}
       backgroundColor={theme.background}
-      onMouseUp={async () => {
-        if (Flag.OPENCODE_EXPERIMENTAL_DISABLE_COPY_ON_SELECT) {
-          renderer.clearSelection()
-          return
-        }
-        const text = renderer.getSelection()?.getSelectedText()
-        if (text && text.length > 0) {
-          await Clipboard.copy(text)
-            .then(() => toast.show({ message: "Copied to clipboard", variant: "info" }))
-            .catch(toast.error)
-          renderer.clearSelection()
-        }
+      onMouseDown={(evt) => {
+        if (!Flag.OPENCODE_EXPERIMENTAL_DISABLE_COPY_ON_SELECT) return
+        if (evt.button !== MouseButton.RIGHT) return
+
+        if (!Selection.copy(renderer, toast)) return
+        evt.preventDefault()
+        evt.stopPropagation()
       }}
+      onMouseUp={Flag.OPENCODE_EXPERIMENTAL_DISABLE_COPY_ON_SELECT ? undefined : () => Selection.copy(renderer, toast)}
     >
       <Show when={!showOnboarding()} fallback={<CerebrasOnboarding onComplete={() => setShowOnboarding(false)} />}>
         <Show
@@ -811,7 +849,8 @@ function ErrorComponent(props: {
   const handleExit = async () => {
     renderer.setTerminalTitle("")
     renderer.destroy()
-    props.onExit()
+    win32FlushInputBuffer()
+    await props.onExit()
   }
 
   useKeyboard((evt) => {
@@ -821,7 +860,7 @@ function ErrorComponent(props: {
   })
   const [copied, setCopied] = createSignal(false)
 
-  const issueURL = new URL("https://github.com/anomalyco/opencode/issues/new?template=bug-report.yml")
+  const issueURL = new URL("https://github.com/kevint-cerebras/cerebras-code-cli/issues/new")
 
   // Choose safe fallback colors per mode since theme context may not be available
   const isLight = props.mode === "light"

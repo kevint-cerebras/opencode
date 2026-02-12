@@ -42,6 +42,7 @@ export namespace LLM {
      *  When provided, injected as a user-role message right before the last
      *  user message so that the stable system + history prefix stays cacheable. */
     environment?: string
+    toolChoice?: "auto" | "required" | "none"
   }
 
   export type StreamOutput = StreamTextResult<ToolSet, unknown>
@@ -239,6 +240,7 @@ export namespace LLM {
       providerOptions: ProviderTransform.providerOptions(input.model, params.options),
       activeTools: Object.keys(tools).filter((x) => x !== "invalid"),
       tools,
+      toolChoice: input.toolChoice,
       maxOutputTokens,
       abortSignal: input.abort,
       headers: {
