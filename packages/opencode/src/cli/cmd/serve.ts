@@ -1,46 +1,20 @@
-import { Provider } from "../../provider/provider"
 import { Server } from "../../server/server"
-import { bootstrap } from "../bootstrap"
 import { cmd } from "./cmd"
+import { withNetworkOptions, resolveNetworkOptions } from "../network"
+import { Flag } from "../../flag/flag"
 
 export const ServeCommand = cmd({
   command: "serve",
-  builder: (yargs) =>
-    yargs
-      .option("port", {
-        alias: ["p"],
-        type: "number",
-        describe: "port to listen on",
-        default: 4096,
-      })
-      .option("hostname", {
-        alias: ["h"],
-        type: "string",
-        describe: "hostname to listen on",
-        default: "127.0.0.1",
-      }),
+  builder: (yargs) => withNetworkOptions(yargs),
   describe: "starts a headless opencode server",
   handler: async (args) => {
-    const cwd = process.cwd()
-    await bootstrap({ cwd }, async () => {
-      const providers = await Provider.list()
-      if (Object.keys(providers).length === 0) {
-        return "needs_provider"
-      }
-
-      const hostname = args.hostname
-      const port = args.port
-
-      const server = Server.listen({
-        port,
-        hostname,
-      })
-
-      console.log(`opencode server listening on http://${server.hostname}:${server.port}`)
-
-      await new Promise(() => {})
-
-      server.stop()
-    })
+    if (!Flag.OPENCODE_SERVER_PASSWORD) {
+      console.log("Warning: OPENCODE_SERVER_PASSWORD is not set; server is unsecured.")
+    }
+    const opts = await resolveNetworkOptions(args)
+    const server = Server.listen(opts)
+    console.log(`opencode server listening on http://${server.hostname}:${server.port}`)
+    await new Promise(() => {})
+    await server.stop()
   },
 })

@@ -3,19 +3,26 @@
 // https://github.com/google-gemini/gemini-cli/blob/main/packages/core/src/utils/editCorrector.ts
 // https://github.com/cline/cline/blob/main/evals/diff-edits/diff-apply/diff-06-26-25.ts
 
-import { z } from "zod"
+import z from "zod"
 import * as path from "path"
 import { Tool } from "./tool"
 import { LSP } from "../lsp"
-import { createTwoFilesPatch } from "diff"
-import { Permission } from "../permission"
+import { createTwoFilesPatch, diffLines } from "diff"
 import DESCRIPTION from "./edit.txt"
-import { App } from "../app/app"
 import { File } from "../file"
+import { FileWatcher } from "../file/watcher"
 import { Bus } from "../bus"
 import { FileTime } from "../file/time"
 import { Filesystem } from "../util/filesystem"
-import { Agent } from "../agent/agent"
+import { Instance } from "../project/instance"
+import { Snapshot } from "@/snapshot"
+import { assertExternalDirectory } from "./external-directory"
+
+const MAX_DIAGNOSTICS_PER_FILE = 20
+
+function normalizeLineEndings(text: string): string {
+  return text.replaceAll("\r\n", "\n")
+}
 
 export const EditTool = Tool.define("edit", {
   description: DESCRIPTION,
@@ -34,37 +41,35 @@ export const EditTool = Tool.define("edit", {
       throw new Error("oldString and newString must be different")
     }
 
-    const app = App.info()
-    const filePath = path.isAbsolute(params.filePath) ? params.filePath : path.join(app.path.cwd, params.filePath)
-    if (!Filesystem.contains(app.path.cwd, filePath)) {
-      throw new Error(`File ${filePath} is not in the current working directory`)
-    }
+    const filePath = path.isAbsolute(params.filePath) ? params.filePath : path.join(Instance.directory, params.filePath)
+    await assertExternalDirectory(ctx, filePath)
 
-    const agent = await Agent.get(ctx.agent)
     let diff = ""
     let contentOld = ""
     let contentNew = ""
-    await (async () => {
+    await FileTime.withLock(filePath, async () => {
       if (params.oldString === "") {
+        const existed = await Bun.file(filePath).exists()
         contentNew = params.newString
         diff = trimDiff(createTwoFilesPatch(filePath, filePath, contentOld, contentNew))
-        if (agent.permission.edit === "ask") {
-          await Permission.ask({
-            type: "edit",
-            sessionID: ctx.sessionID,
-            messageID: ctx.messageID,
-            callID: ctx.callID,
-            title: "Edit this file: " + filePath,
-            metadata: {
-              filePath,
-              diff,
-            },
-          })
-        }
+        await ctx.ask({
+          permission: "edit",
+          patterns: [path.relative(Instance.worktree, filePath)],
+          always: ["*"],
+          metadata: {
+            filepath: filePath,
+            diff,
+          },
+        })
         await Bun.write(filePath, params.newString)
         await Bus.publish(File.Event.Edited, {
           file: filePath,
         })
+        await Bus.publish(FileWatcher.Event.Updated, {
+          file: filePath,
+          event: existed ? "change" : "add",
+        })
+        FileTime.read(ctx.sessionID, filePath)
         return
       }
 
@@ -76,54 +81,74 @@ export const EditTool = Tool.define("edit", {
       contentOld = await file.text()
       contentNew = replace(contentOld, params.oldString, params.newString, params.replaceAll)
 
-      diff = trimDiff(createTwoFilesPatch(filePath, filePath, contentOld, contentNew))
-      if (agent.permission.edit === "ask") {
-        await Permission.ask({
-          type: "edit",
-          sessionID: ctx.sessionID,
-          messageID: ctx.messageID,
-          callID: ctx.callID,
-          pattern: filePath,
-          title: "Edit this file: " + filePath,
-          metadata: {
-            filePath,
-            diff,
-          },
-        })
-      }
+      diff = trimDiff(
+        createTwoFilesPatch(filePath, filePath, normalizeLineEndings(contentOld), normalizeLineEndings(contentNew)),
+      )
+      await ctx.ask({
+        permission: "edit",
+        patterns: [path.relative(Instance.worktree, filePath)],
+        always: ["*"],
+        metadata: {
+          filepath: filePath,
+          diff,
+        },
+      })
 
       await file.write(contentNew)
       await Bus.publish(File.Event.Edited, {
         file: filePath,
       })
+      await Bus.publish(FileWatcher.Event.Updated, {
+        file: filePath,
+        event: "change",
+      })
       contentNew = await file.text()
-      diff = trimDiff(createTwoFilesPatch(filePath, filePath, contentOld, contentNew))
-    })()
+      diff = trimDiff(
+        createTwoFilesPatch(filePath, filePath, normalizeLineEndings(contentOld), normalizeLineEndings(contentNew)),
+      )
+      FileTime.read(ctx.sessionID, filePath)
+    })
 
-    FileTime.read(ctx.sessionID, filePath)
+    const filediff: Snapshot.FileDiff = {
+      file: filePath,
+      before: contentOld,
+      after: contentNew,
+      additions: 0,
+      deletions: 0,
+    }
+    for (const change of diffLines(contentOld, contentNew)) {
+      if (change.added) filediff.additions += change.count || 0
+      if (change.removed) filediff.deletions += change.count || 0
+    }
 
-    let output = ""
+    ctx.metadata({
+      metadata: {
+        diff,
+        filediff,
+        diagnostics: {},
+      },
+    })
+
+    let output = "Edit applied successfully."
     await LSP.touchFile(filePath, true)
     const diagnostics = await LSP.diagnostics()
-    for (const [file, issues] of Object.entries(diagnostics)) {
-      if (issues.length === 0) continue
-      if (file === filePath) {
-        output += `\nThis file has errors, please fix\n<file_diagnostics>\n${issues.map(LSP.Diagnostic.pretty).join("\n")}\n</file_diagnostics>\n`
-        continue
-      }
-      output += `\n<project_diagnostics>\n${file}\n${issues
-        // TODO: may want to make more leniant for eslint
-        .filter((item) => item.severity === 1)
-        .map(LSP.Diagnostic.pretty)
-        .join("\n")}\n</project_diagnostics>\n`
+    const normalizedFilePath = Filesystem.normalizePath(filePath)
+    const issues = diagnostics[normalizedFilePath] ?? []
+    const errors = issues.filter((item) => item.severity === 1)
+    if (errors.length > 0) {
+      const limited = errors.slice(0, MAX_DIAGNOSTICS_PER_FILE)
+      const suffix =
+        errors.length > MAX_DIAGNOSTICS_PER_FILE ? `\n... and ${errors.length - MAX_DIAGNOSTICS_PER_FILE} more` : ""
+      output += `\n\nLSP errors detected in this file, please fix:\n<diagnostics file="${filePath}">\n${limited.map(LSP.Diagnostic.pretty).join("\n")}${suffix}\n</diagnostics>`
     }
 
     return {
       metadata: {
         diagnostics,
         diff,
+        filediff,
       },
-      title: `${path.relative(app.path.root, filePath)}`,
+      title: `${path.relative(Instance.worktree, filePath)}`,
       output,
     }
   },
@@ -554,7 +579,7 @@ export const ContextAwareReplacer: Replacer = function* (content, find) {
   }
 }
 
-function trimDiff(diff: string): string {
+export function trimDiff(diff: string): string {
   const lines = diff.split("\n")
   const contentLines = lines.filter(
     (line) =>
@@ -595,6 +620,8 @@ export function replace(content: string, oldString: string, newString: string, r
     throw new Error("oldString and newString must be different")
   }
 
+  let notFound = true
+
   for (const replacer of [
     SimpleReplacer,
     LineTrimmedReplacer,
@@ -602,13 +629,14 @@ export function replace(content: string, oldString: string, newString: string, r
     WhitespaceNormalizedReplacer,
     IndentationFlexibleReplacer,
     EscapeNormalizedReplacer,
-    // TrimmedBoundaryReplacer,
-    // ContextAwareReplacer,
-    // MultiOccurrenceReplacer,
+    TrimmedBoundaryReplacer,
+    ContextAwareReplacer,
+    MultiOccurrenceReplacer,
   ]) {
     for (const search of replacer(content, oldString)) {
       const index = content.indexOf(search)
       if (index === -1) continue
+      notFound = false
       if (replaceAll) {
         return content.replaceAll(search, newString)
       }
@@ -617,5 +645,11 @@ export function replace(content: string, oldString: string, newString: string, r
       return content.substring(0, index) + newString + content.substring(index + search.length)
     }
   }
-  throw new Error("oldString not found in content or was found multiple times")
+
+  if (notFound) {
+    throw new Error("oldString not found in content")
+  }
+  throw new Error(
+    "Found multiple matches for oldString. Provide more surrounding lines in oldString to identify the correct match.",
+  )
 }

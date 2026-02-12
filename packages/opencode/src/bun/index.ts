@@ -1,9 +1,13 @@
-import { z } from "zod"
+import z from "zod"
 import { Global } from "../global"
 import { Log } from "../util/log"
 import path from "path"
-import { NamedError } from "../util/error"
+import { Filesystem } from "../util/filesystem"
+import { NamedError } from "@opencode-ai/util/error"
 import { readableStreamToText } from "bun"
+import { Lock } from "../util/lock"
+import { PackageRegistry } from "./registry"
+import { proxied } from "@/util/proxied"
 
 export namespace BunProc {
   const log = Log.create({ service: "bun" })
@@ -58,6 +62,9 @@ export namespace BunProc {
   )
 
   export async function install(pkg: string, version = "latest") {
+    // Use lock to ensure only one install at a time
+    using _ = await Lock.write("bun-install")
+
     const mod = path.join(Global.Path.cache, "node_modules", pkg)
     const pkgjson = Bun.file(path.join(Global.Path.cache, "package.json"))
     const parsed = await pkgjson.json().catch(async () => {
@@ -65,16 +72,41 @@ export namespace BunProc {
       await Bun.write(pkgjson.name!, JSON.stringify(result, null, 2))
       return result
     })
-    if (parsed.dependencies[pkg] === version) return mod
+    const dependencies = parsed.dependencies ?? {}
+    if (!parsed.dependencies) parsed.dependencies = dependencies
+    const modExists = await Filesystem.exists(mod)
+    const cachedVersion = dependencies[pkg]
+
+    if (!modExists || !cachedVersion) {
+      // continue to install
+    } else if (version !== "latest" && cachedVersion === version) {
+      return mod
+    } else if (version === "latest") {
+      const isOutdated = await PackageRegistry.isOutdated(pkg, cachedVersion, Global.Path.cache)
+      if (!isOutdated) return mod
+      log.info("Cached version is outdated, proceeding with install", { pkg, cachedVersion })
+    }
 
     // Build command arguments
-    const args = ["add", "--force", "--exact", "--cwd", Global.Path.cache, pkg + "@" + version]
+    const args = [
+      "add",
+      "--force",
+      "--exact",
+      // TODO: get rid of this case (see: https://github.com/oven-sh/bun/issues/19936)
+      ...(proxied() ? ["--no-cache"] : []),
+      "--cwd",
+      Global.Path.cache,
+      pkg + "@" + version,
+    ]
 
     // Let Bun handle registry resolution:
     // - If .npmrc files exist, Bun will use them automatically
     // - If no .npmrc files exist, Bun will default to https://registry.npmjs.org
     // - No need to pass --registry flag
-    log.info("installing package using Bun's default registry resolution", { pkg, version })
+    log.info("installing package using Bun's default registry resolution", {
+      pkg,
+      version,
+    })
 
     await BunProc.run(args, {
       cwd: Global.Path.cache,
@@ -86,7 +118,19 @@ export namespace BunProc {
         },
       )
     })
-    parsed.dependencies[pkg] = version
+
+    // Resolve actual version from installed package when using "latest"
+    // This ensures subsequent starts use the cached version until explicitly updated
+    let resolvedVersion = version
+    if (version === "latest") {
+      const installedPkgJson = Bun.file(path.join(mod, "package.json"))
+      const installedPkg = await installedPkgJson.json().catch(() => null)
+      if (installedPkg?.version) {
+        resolvedVersion = installedPkg.version
+      }
+    }
+
+    parsed.dependencies[pkg] = resolvedVersion
     await Bun.write(pkgjson.name!, JSON.stringify(parsed, null, 2))
     return mod
   }

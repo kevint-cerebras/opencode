@@ -1,9 +1,10 @@
-import { z } from "zod"
+import z from "zod"
 import path from "path"
 import { Tool } from "./tool"
-import { App } from "../app/app"
 import DESCRIPTION from "./glob.txt"
 import { Ripgrep } from "../file/ripgrep"
+import { Instance } from "../project/instance"
+import { assertExternalDirectory } from "./external-directory"
 
 export const GlobTool = Tool.define("glob", {
   description: DESCRIPTION,
@@ -16,17 +17,28 @@ export const GlobTool = Tool.define("glob", {
         `The directory to search in. If not specified, the current working directory will be used. IMPORTANT: Omit this field to use the default directory. DO NOT enter "undefined" or "null" - simply omit it for the default behavior. Must be a valid directory path if provided.`,
       ),
   }),
-  async execute(params) {
-    const app = App.info()
-    let search = params.path ?? app.path.cwd
-    search = path.isAbsolute(search) ? search : path.resolve(app.path.cwd, search)
+  async execute(params, ctx) {
+    await ctx.ask({
+      permission: "glob",
+      patterns: [params.pattern],
+      always: ["*"],
+      metadata: {
+        pattern: params.pattern,
+        path: params.path,
+      },
+    })
+
+    let search = params.path ?? Instance.directory
+    search = path.isAbsolute(search) ? search : path.resolve(Instance.directory, search)
+    await assertExternalDirectory(ctx, search, { kind: "directory" })
 
     const limit = 100
     const files = []
     let truncated = false
-    for (const file of await Ripgrep.files({
+    for await (const file of Ripgrep.files({
       cwd: search,
       glob: [params.pattern],
+      signal: ctx.abort,
     })) {
       if (files.length >= limit) {
         truncated = true
@@ -55,7 +67,7 @@ export const GlobTool = Tool.define("glob", {
     }
 
     return {
-      title: path.relative(app.path.root, search),
+      title: path.relative(Instance.worktree, search),
       metadata: {
         count: files.length,
         truncated,

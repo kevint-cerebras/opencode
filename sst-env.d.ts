@@ -5,12 +5,20 @@
 
 declare module "sst" {
   export interface Resource {
-    "ANTHROPIC_API_KEY": {
+    "ADMIN_SECRET": {
       "type": "sst.sst.Secret"
       "value": string
     }
     "AUTH_API_URL": {
       "type": "sst.sst.Linkable"
+      "value": string
+    }
+    "AWS_SES_ACCESS_KEY_ID": {
+      "type": "sst.sst.Secret"
+      "value": string
+    }
+    "AWS_SES_SECRET_ACCESS_KEY": {
+      "type": "sst.sst.Secret"
       "value": string
     }
     "Api": {
@@ -22,20 +30,30 @@ declare module "sst" {
       "url": string
     }
     "AuthStorage": {
+      "namespaceId": string
       "type": "sst.cloudflare.Kv"
     }
     "Bucket": {
+      "name": string
       "type": "sst.cloudflare.Bucket"
     }
-    "Console": {
-      "type": "sst.cloudflare.StaticSite"
-      "url": string
-    }
-    "DATABASE_PASSWORD": {
+    "CLOUDFLARE_API_TOKEN": {
       "type": "sst.sst.Secret"
       "value": string
     }
-    "DATABASE_USERNAME": {
+    "CLOUDFLARE_DEFAULT_ACCOUNT_ID": {
+      "type": "sst.sst.Secret"
+      "value": string
+    }
+    "Console": {
+      "type": "sst.cloudflare.SolidStart"
+      "url": string
+    }
+    "DISCORD_SUPPORT_BOT_TOKEN": {
+      "type": "sst.sst.Secret"
+      "value": string
+    }
+    "DISCORD_SUPPORT_CHANNEL_ID": {
       "type": "sst.sst.Secret"
       "value": string
     }
@@ -46,6 +64,22 @@ declare module "sst" {
       "port": number
       "type": "sst.sst.Linkable"
       "username": string
+    }
+    "EMAILOCTOPUS_API_KEY": {
+      "type": "sst.sst.Secret"
+      "value": string
+    }
+    "EnterpriseStorage": {
+      "name": string
+      "type": "sst.cloudflare.Bucket"
+    }
+    "FEISHU_APP_ID": {
+      "type": "sst.sst.Secret"
+      "value": string
+    }
+    "FEISHU_APP_SECRET": {
+      "type": "sst.sst.Secret"
+      "value": string
     }
     "GITHUB_APP_ID": {
       "type": "sst.sst.Secret"
@@ -67,11 +101,26 @@ declare module "sst" {
       "type": "sst.sst.Secret"
       "value": string
     }
-    "GatewayApi": {
-      "type": "sst.cloudflare.Worker"
-      "url": string
+    "GatewayKv": {
+      "namespaceId": string
+      "type": "sst.cloudflare.Kv"
     }
-    "OPENAI_API_KEY": {
+    "HONEYCOMB_API_KEY": {
+      "type": "sst.sst.Secret"
+      "value": string
+    }
+    "LogProcessor": {
+      "type": "sst.cloudflare.Worker"
+    }
+    "R2AccessKey": {
+      "type": "sst.sst.Secret"
+      "value": string
+    }
+    "R2SecretKey": {
+      "type": "sst.sst.Secret"
+      "value": string
+    }
+    "STRIPE_PUBLISHABLE_KEY": {
       "type": "sst.sst.Secret"
       "value": string
     }
@@ -83,13 +132,120 @@ declare module "sst" {
       "type": "sst.sst.Linkable"
       "value": string
     }
+    "Teams": {
+      "type": "sst.cloudflare.SolidStart"
+      "url": string
+    }
     "Web": {
       "type": "sst.cloudflare.Astro"
       "url": string
     }
-    "ZHIPU_API_KEY": {
+    "WebApp": {
+      "type": "sst.cloudflare.StaticSite"
+      "url": string
+    }
+    "ZEN_BLACK_LIMITS": {
       "type": "sst.sst.Secret"
       "value": string
+    }
+    "ZEN_BLACK_PRICE": {
+      "plan100": string
+      "plan20": string
+      "plan200": string
+      "product": string
+      "type": "sst.sst.Linkable"
+    }
+    "ZEN_MODELS1": {
+      "type": "sst.sst.Secret"
+      "value": string
+    }
+    "ZEN_MODELS10": {
+      "type": "sst.sst.Secret"
+      "value": string
+    }
+    "ZEN_MODELS11": {
+      "type": "sst.sst.Secret"
+      "value": string
+    }
+    "ZEN_MODELS12": {
+      "type": "sst.sst.Secret"
+      "value": string
+    }
+    "ZEN_MODELS13": {
+      "type": "sst.sst.Secret"
+      "value": string
+    }
+    "ZEN_MODELS14": {
+      "type": "sst.sst.Secret"
+      "value": string
+    }
+    "ZEN_MODELS15": {
+      "type": "sst.sst.Secret"
+      "value": string
+    }
+    "ZEN_MODELS16": {
+      "type": "sst.sst.Secret"
+      "value": string
+    }
+    "ZEN_MODELS17": {
+      "type": "sst.sst.Secret"
+      "value": string
+    }
+    "ZEN_MODELS18": {
+      "type": "sst.sst.Secret"
+      "value": string
+    }
+    "ZEN_MODELS19": {
+      "type": "sst.sst.Secret"
+      "value": string
+    }
+    "ZEN_MODELS2": {
+      "type": "sst.sst.Secret"
+      "value": string
+    }
+    "ZEN_MODELS20": {
+      "type": "sst.sst.Secret"
+      "value": string
+    }
+    "ZEN_MODELS3": {
+      "type": "sst.sst.Secret"
+      "value": string
+    }
+    "ZEN_MODELS4": {
+      "type": "sst.sst.Secret"
+      "value": string
+    }
+    "ZEN_MODELS5": {
+      "type": "sst.sst.Secret"
+      "value": string
+    }
+    "ZEN_MODELS6": {
+      "type": "sst.sst.Secret"
+      "value": string
+    }
+    "ZEN_MODELS7": {
+      "type": "sst.sst.Secret"
+      "value": string
+    }
+    "ZEN_MODELS8": {
+      "type": "sst.sst.Secret"
+      "value": string
+    }
+    "ZEN_MODELS9": {
+      "type": "sst.sst.Secret"
+      "value": string
+    }
+    "ZEN_SESSION_SECRET": {
+      "type": "sst.sst.Secret"
+      "value": string
+    }
+    "ZenData": {
+      "name": string
+      "type": "sst.cloudflare.Bucket"
+    }
+    "ZenDataNew": {
+      "name": string
+      "type": "sst.cloudflare.Bucket"
     }
   }
 }

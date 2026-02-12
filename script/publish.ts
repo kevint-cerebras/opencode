@@ -1,18 +1,37 @@
 #!/usr/bin/env bun
 
 import { $ } from "bun"
+import { Script } from "@opencode-ai/script"
+
+const highlightsTemplate = `
+<!--
+Add highlights before publishing. Delete this section if no highlights.
+
+- For multiple highlights, use multiple <highlight> tags
+- Highlights with the same source attribute get grouped together
+-->
+
+<!--
+<highlight source="SourceName (TUI/Desktop/Web/Core)">
+  <h2>Feature title goes here</h2>
+  <p short="Short description used for Desktop Recap">
+    Full description of the feature or change
+  </p>
+
+  https://github.com/user-attachments/assets/uuid-for-video (you will want to drag & drop the video or picture)
+
+  <img
+    width="1912"
+    height="1164"
+    alt="image"
+    src="https://github.com/user-attachments/assets/uuid-for-image"
+  />
+</highlight>
+-->
+
+`
 
 console.log("=== publishing ===\n")
-
-const snapshot = process.env["OPENCODE_SNAPSHOT"] === "true"
-const version = snapshot
-  ? `0.0.0-${new Date().toISOString().slice(0, 16).replace(/[-:T]/g, "")}`
-  : process.env["OPENCODE_VERSION"]
-if (!version) {
-  throw new Error("OPENCODE_VERSION is required")
-}
-process.env["OPENCODE_VERSION"] = version
-console.log("version:", version)
 
 const pkgjsons = await Array.fromAsync(
   new Bun.Glob("**/package.json").scan({
@@ -20,16 +39,34 @@ const pkgjsons = await Array.fromAsync(
   }),
 ).then((arr) => arr.filter((x) => !x.includes("node_modules") && !x.includes("dist")))
 
-const tree = await $`git add . && git write-tree`.text().then((x) => x.trim())
 for (const file of pkgjsons) {
   let pkg = await Bun.file(file).text()
-  pkg = pkg.replaceAll(/"version": "[^"]+"/g, `"version": "${version}"`)
+  pkg = pkg.replaceAll(/"version": "[^"]+"/g, `"version": "${Script.version}"`)
   console.log("updated:", file)
   await Bun.file(file).write(pkg)
 }
-await $`bun install`
 
-console.log("\n=== opencode ===\n")
+const extensionToml = new URL("../packages/extensions/zed/extension.toml", import.meta.url).pathname
+let toml = await Bun.file(extensionToml).text()
+toml = toml.replace(/^version = "[^"]+"/m, `version = "${Script.version}"`)
+toml = toml.replaceAll(/releases\/download\/v[^/]+\//g, `releases/download/v${Script.version}/`)
+console.log("updated:", extensionToml)
+await Bun.file(extensionToml).write(toml)
+
+await $`bun install`
+await import(`../packages/sdk/js/script/build.ts`)
+
+if (Script.release) {
+  await $`git commit -am "release: v${Script.version}"`
+  await $`git tag v${Script.version}`
+  await $`git fetch origin`
+  await $`git cherry-pick HEAD..origin/dev`.nothrow()
+  await $`git push origin HEAD --tags --no-verify --force-with-lease`
+  await new Promise((resolve) => setTimeout(resolve, 5_000))
+  await $`gh release edit v${Script.version} --draft=false`
+}
+
+console.log("\n=== cli ===\n")
 await import(`../packages/opencode/script/publish.ts`)
 
 console.log("\n=== sdk ===\n")
@@ -40,55 +77,3 @@ await import(`../packages/plugin/script/publish.ts`)
 
 const dir = new URL("..", import.meta.url).pathname
 process.chdir(dir)
-
-if (!snapshot) {
-  await $`git commit -am "release: v${version}"`
-  await $`git tag v${version}`
-  await $`git fetch origin`
-  await $`git cherry-pick HEAD..origin/dev`.nothrow()
-  await $`git push origin HEAD --tags --no-verify --force`
-
-  const previous = await fetch("https://api.github.com/repos/sst/opencode/releases/latest")
-    .then((res) => {
-      if (!res.ok) throw new Error(res.statusText)
-      return res.json()
-    })
-    .then((data) => data.tag_name)
-
-  console.log("finding commits between", previous, "and", "HEAD")
-  const commits = await fetch(`https://api.github.com/repos/sst/opencode/compare/${previous}...HEAD`)
-    .then((res) => res.json())
-    .then((data) => data.commits || [])
-
-  const raw = commits.map((commit: any) => `- ${commit.commit.message.split("\n").join(" ")}`)
-  console.log(raw)
-
-  const notes =
-    raw
-      .filter((x: string) => {
-        const lower = x.toLowerCase()
-        return (
-          !lower.includes("release:") &&
-          !lower.includes("ignore:") &&
-          !lower.includes("chore:") &&
-          !lower.includes("ci:") &&
-          !lower.includes("wip:") &&
-          !lower.includes("docs:") &&
-          !lower.includes("doc:")
-        )
-      })
-      .join("\n") || "No notable changes"
-
-  await $`gh release create v${version} --title "v${version}" --notes ${notes} ./packages/opencode/dist/*.zip`
-}
-if (snapshot) {
-  await $`git checkout -b snapshot-${version}`
-  await $`git commit --allow-empty -m "Snapshot release v${version}"`
-  await $`git tag v${version}`
-  await $`git push origin v${version} --no-verify`
-  await $`git checkout dev`
-  await $`git branch -D snapshot-${version}`
-  for (const file of pkgjsons) {
-    await $`git checkout ${tree} ${file}`
-  }
-}

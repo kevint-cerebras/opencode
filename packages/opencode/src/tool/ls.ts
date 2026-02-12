@@ -1,8 +1,10 @@
-import { z } from "zod"
+import z from "zod"
 import { Tool } from "./tool"
-import { App } from "../app/app"
 import * as path from "path"
 import DESCRIPTION from "./ls.txt"
+import { Instance } from "../project/instance"
+import { Ripgrep } from "../file/ripgrep"
+import { assertExternalDirectory } from "./external-directory"
 
 export const IGNORE_PATTERNS = [
   "node_modules/",
@@ -39,16 +41,22 @@ export const ListTool = Tool.define("list", {
     path: z.string().describe("The absolute path to the directory to list (must be absolute, not relative)").optional(),
     ignore: z.array(z.string()).describe("List of glob patterns to ignore").optional(),
   }),
-  async execute(params) {
-    const app = App.info()
-    const searchPath = path.resolve(app.path.cwd, params.path || ".")
+  async execute(params, ctx) {
+    const searchPath = path.resolve(Instance.directory, params.path || ".")
+    await assertExternalDirectory(ctx, searchPath, { kind: "directory" })
 
-    const glob = new Bun.Glob("**/*")
+    await ctx.ask({
+      permission: "list",
+      patterns: [searchPath],
+      always: ["*"],
+      metadata: {
+        path: searchPath,
+      },
+    })
+
+    const ignoreGlobs = IGNORE_PATTERNS.map((p) => `!${p}*`).concat(params.ignore?.map((p) => `!${p}`) || [])
     const files = []
-
-    for await (const file of glob.scan({ cwd: searchPath, dot: true })) {
-      if (IGNORE_PATTERNS.some((p) => file.includes(p))) continue
-      if (params.ignore?.some((pattern) => new Bun.Glob(pattern).match(file))) continue
+    for await (const file of Ripgrep.files({ cwd: searchPath, glob: ignoreGlobs, signal: ctx.abort })) {
       files.push(file)
       if (files.length >= LIMIT) break
     }
@@ -102,7 +110,7 @@ export const ListTool = Tool.define("list", {
     const output = `${searchPath}/\n` + renderDir(".", 0)
 
     return {
-      title: path.relative(app.path.root, searchPath),
+      title: path.relative(Instance.worktree, searchPath),
       metadata: {
         count: files.length,
         truncated: files.length >= LIMIT,
