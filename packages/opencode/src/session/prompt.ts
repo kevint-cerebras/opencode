@@ -681,16 +681,26 @@ export namespace SessionPrompt {
 
       let sessionMessages = clone(msgs)
 
-      // Ralph: always strip message history to current turn only, inject context from files.
-      // This prevents context bloat on ALL ralph turns — first message, tool-call
-      // continuations, and synthetic continues alike.
+      // Ralph: strip message history ONLY during autonomous loop iterations (synthetic
+      // ralph-continue messages). During planning/user interaction, keep full history so the
+      // model remembers the original request and the conversation.
       if (lastUser.agent === "ralph") {
-        const turnStart = sessionMessages.findLastIndex((m) => m.info.role === "user")
-        if (turnStart > 0) {
-          sessionMessages = sessionMessages.slice(turnStart)
+        const isSyntheticContinue = sessionMessages
+          .findLast((m) => m.info.role === "user")
+          ?.parts.some(
+            (p) =>
+              p.type === "text" &&
+              "metadata" in p &&
+              (p as MessageV2.TextPart).metadata?.source === "ralph-continue",
+          )
+        if (isSyntheticContinue) {
+          const turnStart = sessionMessages.findLastIndex((m) => m.info.role === "user")
+          if (turnStart > 0) {
+            sessionMessages = sessionMessages.slice(turnStart)
+          }
         }
 
-        // Inject CWD, plan, progress log, and task list so the model has context without history
+        // Inject CWD, plan, progress log, and task list so the model has context
         const lastUserMsg = sessionMessages.find((m) => m.info.role === "user")
         if (lastUserMsg) {
           const planPath = path.join(Instance.worktree, ".opencode/plans/ralph-plan.md")
