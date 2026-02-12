@@ -44,7 +44,7 @@ let arch = archMap[os.arch()]
 if (!arch) {
   arch = os.arch()
 }
-const base = "opencode-" + platform + "-" + arch
+const base = "cerebras-cli-" + platform + "-" + arch
 const binary = platform === "windows" ? "cerebras.exe" : "cerebras"
 
 function supportsAvx2() {
