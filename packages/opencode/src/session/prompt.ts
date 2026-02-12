@@ -18,6 +18,8 @@ import { SystemPrompt } from "./system"
 import { InstructionPrompt } from "./instruction"
 import { Plugin } from "../plugin"
 import PROMPT_PLAN from "../session/prompt/plan.txt"
+import PROMPT_RALPH from "../session/prompt/ralph.txt"
+import RALPH_CONTINUE from "../session/prompt/ralph-continue.txt"
 import BUILD_SWITCH from "../session/prompt/build-switch.txt"
 import MAX_STEPS from "../session/prompt/max-steps.txt"
 import { defer } from "../util/defer"
@@ -46,6 +48,8 @@ import { LLM } from "./llm"
 import { iife } from "@/util/iife"
 import { Shell } from "@/shell/shell"
 import { Truncate } from "@/tool/truncation"
+import { Todo } from "./todo"
+import { Token } from "../util/token"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -277,6 +281,9 @@ export namespace SessionPrompt {
     using _ = defer(() => cancel(sessionID))
 
     let step = 0
+    let ralphDone = false
+    const maxRalphIterations = 25
+    const maxRalphSteps = 200
     const session = await Session.get(sessionID)
     while (true) {
       SessionStatus.set(sessionID, { type: "busy" })
@@ -302,11 +309,87 @@ export namespace SessionPrompt {
       }
 
       if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
+
+      // Hard safety cap on total LLM calls for ralph mode
+      if (lastUser.agent === "ralph" && step >= maxRalphSteps) {
+        log.info("ralph hard step limit reached", { step, max: maxRalphSteps })
+        break
+      }
+
+      // Detect ralph loop completion from assistant parts
+      if (lastUser.agent === "ralph" && lastAssistant && !ralphDone) {
+        const assistantMsg = msgs.find((m) => m.info.id === lastAssistant!.id)
+        if (assistantMsg?.parts.some((p) => p.type === "tool" && p.tool === "loopcomplete")) {
+          ralphDone = true
+        }
+      }
+
       if (
         lastAssistant?.finish &&
         !["tool-calls", "unknown"].includes(lastAssistant.finish) &&
         lastUser.id < lastAssistant.id
       ) {
+        // Ralph loop continuation
+        if (lastUser.agent === "ralph" && !ralphDone) {
+          // If the model produced pure text with no tool calls, it's consulting the
+          // user (asking questions, presenting a plan). Pause and wait for input.
+          const assistantMsg = msgs.find((m) => m.info.id === lastAssistant!.id)
+          const usedTools = assistantMsg?.parts.some((p) => p.type === "tool")
+          if (!usedTools) {
+            log.info("ralph pausing for user input", { sessionID })
+            break
+          }
+
+          // Count ralph continues since the last real (non-synthetic) user message.
+          // Naturally resets when the user sends a new message after a loop ends.
+          let lastRealIdx = -1
+          for (let i = msgs.length - 1; i >= 0; i--) {
+            if (
+              msgs[i].info.role === "user" &&
+              !msgs[i].parts.every((p) => "synthetic" in p && p.synthetic)
+            ) {
+              lastRealIdx = i
+              break
+            }
+          }
+          const ralphIteration = msgs
+            .slice(lastRealIdx + 1)
+            .filter(
+              (m) =>
+                m.info.role === "user" &&
+                m.parts.some(
+                  (p) =>
+                    p.type === "text" &&
+                    "metadata" in p &&
+                    (p as MessageV2.TextPart).metadata?.source === "ralph-continue",
+                ),
+            ).length
+          if (ralphIteration < maxRalphIterations) {
+            log.info("ralph loop continuing", {
+              iteration: ralphIteration + 1,
+              max: maxRalphIterations,
+            })
+            const continueMsg: MessageV2.User = {
+              id: Identifier.ascending("message"),
+              sessionID,
+              role: "user",
+              time: { created: Date.now() },
+              agent: lastUser.agent,
+              model: lastUser.model,
+            }
+            await Session.updateMessage(continueMsg)
+            await Session.updatePart({
+              type: "text",
+              id: Identifier.ascending("part"),
+              messageID: continueMsg.id,
+              sessionID,
+              text: RALPH_CONTINUE,
+              synthetic: true,
+              metadata: { source: "ralph-continue" },
+            })
+            continue
+          }
+        }
         log.info("exiting loop", { sessionID })
         break
       }
@@ -502,8 +585,8 @@ export namespace SessionPrompt {
           } satisfies MessageV2.TextPart)
         }
 
-        continue
-      }
+          continue
+        }
 
       // pending compaction
       if (task?.type === "compaction") {
@@ -515,7 +598,7 @@ export namespace SessionPrompt {
           auto: task.auto,
         })
         if (result === "stop") break
-        continue
+          continue
       }
 
       // context overflow, needs compaction
@@ -596,7 +679,109 @@ export namespace SessionPrompt {
         })
       }
 
-      const sessionMessages = clone(msgs)
+      let sessionMessages = clone(msgs)
+
+      // Ralph: strip message history ONLY during autonomous loop iterations (synthetic
+      // ralph-continue messages). During planning/user interaction, keep full history so the
+      // model remembers the original request and the conversation.
+      if (lastUser.agent === "ralph") {
+        const isSyntheticContinue = sessionMessages
+          .findLast((m) => m.info.role === "user")
+          ?.parts.some(
+            (p) =>
+              p.type === "text" &&
+              "metadata" in p &&
+              (p as MessageV2.TextPart).metadata?.source === "ralph-continue",
+          )
+        if (isSyntheticContinue) {
+          const turnStart = sessionMessages.findLastIndex((m) => m.info.role === "user")
+          if (turnStart > 0) {
+            sessionMessages = sessionMessages.slice(turnStart)
+          }
+        }
+
+        // Inject CWD, plan, progress log, and task list so the model has context
+        const lastUserMsg = sessionMessages.find((m) => m.info.role === "user")
+        if (lastUserMsg) {
+          const planPath = path.join(Instance.worktree, ".opencode/plans/ralph-plan.md")
+          const progressPath = path.join(Instance.worktree, ".opencode/plans/progress.txt")
+          const planContent = await Bun.file(planPath)
+            .text()
+            .catch(() => "")
+          const progressContent = await Bun.file(progressPath)
+            .text()
+            .catch(() => "")
+          const todos = await Todo.get(sessionID)
+          const todoList = todos.length > 0
+            ? todos.map((t) => `- [${t.status}] ${t.content}`).join("\n")
+            : ""
+
+          const parts = [
+            `## CWD\n${Instance.directory}`,
+            planContent ? `## Plan\n${planContent}` : "",
+            progressContent ? `## Progress\n${progressContent}` : "",
+            todoList ? `## Tasks\n${todoList}` : "",
+          ].filter(Boolean)
+
+          if (parts.length > 0) {
+            lastUserMsg.parts.push({
+              id: Identifier.ascending("part"),
+              messageID: lastUserMsg.info.id,
+              sessionID,
+              type: "text",
+              text: parts.join("\n\n"),
+              synthetic: true,
+            })
+          }
+        }
+
+        // Enforce token budget: estimate total context and truncate old tool outputs
+        // if we're approaching the model's limit. The compaction overflow check (above)
+        // can't catch this because it runs before we inject plan/progress/todos.
+        const budget = model.limit.input
+          ? model.limit.input - ProviderTransform.maxOutputTokens(model)
+          : model.limit.context - ProviderTransform.maxOutputTokens(model)
+        if (budget > 0) {
+          let total = 0
+          for (const msg of sessionMessages) {
+            for (const part of msg.parts) {
+              if (part.type === "text") total += Token.estimate(part.text)
+              if (part.type === "tool" && part.state.status === "completed") {
+                total += Token.estimate(
+                  typeof part.state.output === "string"
+                    ? part.state.output
+                    : JSON.stringify(part.state.output),
+                )
+              }
+            }
+          }
+          // If over 80% of budget, truncate tool outputs from oldest to newest
+          if (total > budget * 0.8) {
+            log.info("ralph token budget exceeded, truncating tool outputs", {
+              estimated: total,
+              budget,
+            })
+            for (const msg of sessionMessages) {
+              if (total <= budget * 0.6) break
+              for (const part of msg.parts) {
+                if (total <= budget * 0.6) break
+                if (part.type === "tool" && part.state.status === "completed") {
+                  const output =
+                    typeof part.state.output === "string"
+                      ? part.state.output
+                      : JSON.stringify(part.state.output)
+                  const tokens = Token.estimate(output)
+                  if (tokens > 500) {
+                    const truncated = `[Output truncated - was ${tokens} tokens. Tool: ${part.tool}]`
+                    part.state.output = truncated
+                    total -= tokens - Token.estimate(truncated)
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
 
       // Ephemerally wrap queued user messages with a reminder to stay on track
       if (step > 1 && lastFinished) {
@@ -624,7 +809,8 @@ export namespace SessionPrompt {
         agent,
         abort,
         sessionID,
-        system: [...(await SystemPrompt.environment(model)), ...(await InstructionPrompt.system())],
+        system: [...(await InstructionPrompt.system())],
+        environment: (await SystemPrompt.environment(model)).join("\n"),
         messages: [
           ...MessageV2.toModelMessages(sessionMessages, model),
           ...(isLastStep
@@ -683,29 +869,29 @@ export namespace SessionPrompt {
 
     const context = (args: any, options: ToolCallOptions): Tool.Context => ({
       sessionID: input.session.id,
-      abort: options.abortSignal!,
-      messageID: input.processor.message.id,
-      callID: options.toolCallId,
+            abort: options.abortSignal!,
+            messageID: input.processor.message.id,
+            callID: options.toolCallId,
       extra: { model: input.model, bypassAgentCheck: input.bypassAgentCheck },
-      agent: input.agent.name,
+            agent: input.agent.name,
       messages: input.messages,
       metadata: async (val: { title?: string; metadata?: any }) => {
-        const match = input.processor.partFromToolCall(options.toolCallId)
-        if (match && match.state.status === "running") {
-          await Session.updatePart({
-            ...match,
-            state: {
-              title: val.title,
-              metadata: val.metadata,
-              status: "running",
-              input: args,
-              time: {
-                start: Date.now(),
-              },
+              const match = input.processor.partFromToolCall(options.toolCallId)
+              if (match && match.state.status === "running") {
+                await Session.updatePart({
+                  ...match,
+                  state: {
+                    title: val.title,
+                    metadata: val.metadata,
+                    status: "running",
+                    input: args,
+                    time: {
+                      start: Date.now(),
+                    },
+                  },
+                })
+              }
             },
-          })
-        }
-      },
       async ask(req) {
         await PermissionNext.ask({
           ...req,
@@ -1055,12 +1241,12 @@ export namespace SessionPrompt {
                     }
                     const result = await t.execute(args, readCtx)
                     pieces.push({
-                      id: Identifier.ascending("part"),
-                      messageID: info.id,
-                      sessionID: input.sessionID,
-                      type: "text",
-                      synthetic: true,
-                      text: result.output,
+                    id: Identifier.ascending("part"),
+                    messageID: info.id,
+                    sessionID: input.sessionID,
+                    type: "text",
+                    synthetic: true,
+                    text: result.output,
                     })
                     if (result.attachments?.length) {
                       pieces.push(
@@ -1074,10 +1260,10 @@ export namespace SessionPrompt {
                       )
                     } else {
                       pieces.push({
-                        ...part,
-                        id: part.id ?? Identifier.ascending("part"),
-                        messageID: info.id,
-                        sessionID: input.sessionID,
+                    ...part,
+                    id: part.id ?? Identifier.ascending("part"),
+                    messageID: info.id,
+                    sessionID: input.sessionID,
                       })
                     }
                   })
@@ -1106,13 +1292,13 @@ export namespace SessionPrompt {
               if (part.mime === "application/x-directory") {
                 const args = { path: filepath }
                 const listCtx: Tool.Context = {
-                  sessionID: input.sessionID,
-                  abort: new AbortController().signal,
-                  agent: input.agent!,
-                  messageID: info.id,
-                  extra: { bypassCwdCheck: true },
+                    sessionID: input.sessionID,
+                    abort: new AbortController().signal,
+                    agent: input.agent!,
+                    messageID: info.id,
+                    extra: { bypassCwdCheck: true },
                   messages: [],
-                  metadata: async () => {},
+                    metadata: async () => {},
                   ask: async () => {},
                 }
                 const result = await ListTool.init().then((t) => t.execute(args, listCtx))
@@ -1235,31 +1421,42 @@ export namespace SessionPrompt {
     const userMessage = input.messages.findLast((msg) => msg.info.role === "user")
     if (!userMessage) return input.messages
 
+    if (input.agent.name === "ralph") {
+      userMessage.parts.push({
+        id: Identifier.ascending("part"),
+        messageID: userMessage.info.id,
+        sessionID: userMessage.info.sessionID,
+        type: "text",
+        text: PROMPT_RALPH,
+        synthetic: true,
+      })
+    }
+
     // Original logic when experimental plan mode is disabled
     if (!Flag.OPENCODE_EXPERIMENTAL_PLAN_MODE) {
-      if (input.agent.name === "plan") {
-        userMessage.parts.push({
-          id: Identifier.ascending("part"),
-          messageID: userMessage.info.id,
-          sessionID: userMessage.info.sessionID,
-          type: "text",
-          text: PROMPT_PLAN,
-          synthetic: true,
-        })
-      }
-      const wasPlan = input.messages.some((msg) => msg.info.role === "assistant" && msg.info.agent === "plan")
-      if (wasPlan && input.agent.name === "build") {
-        userMessage.parts.push({
-          id: Identifier.ascending("part"),
-          messageID: userMessage.info.id,
-          sessionID: userMessage.info.sessionID,
-          type: "text",
-          text: BUILD_SWITCH,
-          synthetic: true,
-        })
-      }
-      return input.messages
+    if (input.agent.name === "plan") {
+      userMessage.parts.push({
+        id: Identifier.ascending("part"),
+        messageID: userMessage.info.id,
+        sessionID: userMessage.info.sessionID,
+        type: "text",
+        text: PROMPT_PLAN,
+        synthetic: true,
+      })
     }
+      const wasPlan = input.messages.some((msg) => msg.info.role === "assistant" && msg.info.agent === "plan")
+    if (wasPlan && input.agent.name === "build") {
+      userMessage.parts.push({
+        id: Identifier.ascending("part"),
+        messageID: userMessage.info.id,
+        sessionID: userMessage.info.sessionID,
+        type: "text",
+        text: BUILD_SWITCH,
+        synthetic: true,
+      })
+    }
+    return input.messages
+  }
 
     // New plan mode logic when flag is enabled
     const assistantMessage = input.messages.findLast((msg) => msg.info.role === "assistant")
@@ -1289,7 +1486,7 @@ export namespace SessionPrompt {
       const exists = await Bun.file(plan).exists()
       if (!exists) await fs.mkdir(path.dirname(plan), { recursive: true })
       const part = await Session.updatePart({
-        id: Identifier.ascending("part"),
+                  id: Identifier.ascending("part"),
         messageID: userMessage.info.id,
         sessionID: userMessage.info.sessionID,
         type: "text",
@@ -1721,7 +1918,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         const { providerID, modelID, suggestions } = e.data
         const hint = suggestions?.length ? ` Did you mean: ${suggestions.join(", ")}?` : ""
         Bus.publish(Session.Event.Error, {
-          sessionID: input.sessionID,
+        sessionID: input.sessionID,
           error: new NamedError.Unknown({ message: `Model not found: ${providerID}/${modelID}.${hint}` }).toObject(),
         })
       }
@@ -1769,7 +1966,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       "command.execute.before",
       {
         command: input.command,
-        sessionID: input.sessionID,
+          sessionID: input.sessionID,
         arguments: input.arguments,
       },
       { parts },
@@ -1805,7 +2002,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
 
     // Find first non-synthetic user message
     const firstRealUserIdx = input.history.findIndex(
-      (m) => m.info.role === "user" && !m.parts.every((p) => "synthetic" in p && p.synthetic),
+        (m) => m.info.role === "user" && !m.parts.every((p) => "synthetic" in p && p.synthetic),
     )
     if (firstRealUserIdx === -1) return
 
@@ -1844,7 +2041,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       retries: 2,
       messages: [
         {
-          role: "user",
+              role: "user",
           content: "Generate a title for this conversation:\n",
         },
         ...(hasOnlySubtaskParts
@@ -1858,14 +2055,14 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         input.session.id,
         (draft) => {
           const cleaned = text
-            .replace(/<think>[\s\S]*?<\/think>\s*/g, "")
-            .split("\n")
-            .map((line) => line.trim())
-            .find((line) => line.length > 0)
-          if (!cleaned) return
+              .replace(/<think>[\s\S]*?<\/think>\s*/g, "")
+              .split("\n")
+              .map((line) => line.trim())
+              .find((line) => line.length > 0)
+            if (!cleaned) return
 
-          const title = cleaned.length > 100 ? cleaned.substring(0, 97) + "..." : cleaned
-          draft.title = title
+            const title = cleaned.length > 100 ? cleaned.substring(0, 97) + "..." : cleaned
+            draft.title = title
         },
         { touch: false },
       )

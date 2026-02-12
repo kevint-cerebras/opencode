@@ -54,6 +54,7 @@ export namespace Agent {
     const skillDirs = await Skill.dirs()
     const defaults = PermissionNext.fromConfig({
       "*": "allow",
+      loopcomplete: "deny",
       doom_loop: "ask",
       external_directory: {
         "*": "ask",
@@ -151,6 +152,22 @@ export namespace Agent {
         prompt: PROMPT_EXPLORE,
         options: {},
         mode: "subagent",
+        native: true,
+      },
+      ralph: {
+        name: "ralph",
+        description:
+          "Autonomous loop agent that iterates on a task until complete. Best for large refactors, migrations, and multi-step tasks with clear done criteria.",
+        options: {},
+        permission: PermissionNext.merge(
+          defaults,
+          PermissionNext.fromConfig({
+            loopcomplete: "allow",
+            question: "allow",
+          }),
+          user,
+        ),
+        mode: "primary",
         native: true,
       },
       compaction: {
