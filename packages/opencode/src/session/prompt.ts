@@ -809,7 +809,8 @@ export namespace SessionPrompt {
         agent,
         abort,
         sessionID,
-        system: [...(await SystemPrompt.environment(model)), ...(await InstructionPrompt.system())],
+        system: [...(await InstructionPrompt.system())],
+        environment: (await SystemPrompt.environment(model)).join("\n"),
         messages: [
           ...MessageV2.toModelMessages(sessionMessages, model),
           ...(isLastStep

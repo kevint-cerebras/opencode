@@ -38,6 +38,10 @@ export namespace LLM {
     small?: boolean
     tools: Record<string, Tool>
     retries?: number
+    /** Dynamic environment context (working dir, git status, date, etc.).
+     *  When provided, injected as a user-role message right before the last
+     *  user message so that the stable system + history prefix stays cacheable. */
+    environment?: string
   }
 
   export type StreamOutput = StreamTextResult<ToolSet, unknown>
@@ -172,6 +176,36 @@ export namespace LLM {
       })
     }
 
+    // Build message array with cache-optimal ordering:
+    // [system messages] [conversation history] [environment (dynamic)] [last user message]
+    // This keeps the system + history prefix stable across turns for prompt caching.
+    const systemMsgs = system.map(
+      (x): ModelMessage => ({
+        role: "system",
+        content: x,
+      }),
+    )
+
+    let finalMessages: ModelMessage[]
+    if (input.environment) {
+      // Find the last user message index to inject environment before it
+      let lastUserIdx = input.messages.length
+      for (let i = input.messages.length - 1; i >= 0; i--) {
+        if (input.messages[i].role === "user") {
+          lastUserIdx = i
+          break
+        }
+      }
+      finalMessages = [
+        ...systemMsgs,
+        ...input.messages.slice(0, lastUserIdx),
+        { role: "user" as const, content: input.environment },
+        ...input.messages.slice(lastUserIdx),
+      ]
+    } else {
+      finalMessages = [...systemMsgs, ...input.messages]
+    }
+
     return streamText({
       onError(error) {
         l.error("stream error", {
@@ -224,15 +258,7 @@ export namespace LLM {
         ...headers,
       },
       maxRetries: input.retries ?? 0,
-      messages: [
-        ...system.map(
-          (x): ModelMessage => ({
-            role: "system",
-            content: x,
-          }),
-        ),
-        ...input.messages,
-      ],
+      messages: finalMessages,
       model: wrapLanguageModel({
         model: language,
         middleware: [

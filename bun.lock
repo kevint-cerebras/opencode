@@ -262,7 +262,7 @@
       "name": "opencode",
       "version": "1.1.59",
       "bin": {
-        "opencode": "./bin/opencode",
+        "cerebras": "./bin/cerebras",
       },
       "dependencies": {
         "@actions/core": "1.11.1",
