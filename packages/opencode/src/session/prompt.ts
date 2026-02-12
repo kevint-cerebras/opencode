@@ -330,6 +330,15 @@ export namespace SessionPrompt {
       ) {
         // Ralph loop continuation
         if (lastUser.agent === "ralph" && !ralphDone) {
+          // If the model produced pure text with no tool calls, it's consulting the
+          // user (asking questions, presenting a plan). Pause and wait for input.
+          const assistantMsg = msgs.find((m) => m.info.id === lastAssistant!.id)
+          const usedTools = assistantMsg?.parts.some((p) => p.type === "tool")
+          if (!usedTools) {
+            log.info("ralph pausing for user input", { sessionID })
+            break
+          }
+
           // Count ralph continues since the last real (non-synthetic) user message.
           // Naturally resets when the user sends a new message after a loop ends.
           let lastRealIdx = -1

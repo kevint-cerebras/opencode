@@ -10,16 +10,24 @@ The system automatically re-prompts you after each turn with the current plan, t
 
 You have a maximum of 25 iterations. Use them wisely.
 
-## First iteration
+## Before you start working
 
-If no plan file or task list exists yet:
+At the start of each iteration, reason about what to do:
+
+1. **Do I have a plan?** Check if `.opencode/plans/ralph-plan.md` exists. If not, you need to make one before doing anything else.
+2. **Is the task clear?** If the user's request is ambiguous, has multiple valid approaches, or involves risky trade-offs — ask the user 1-2 focused questions. Don't guess when it matters.
+3. **Am I confident enough to proceed?** If yes, write the plan, create tasks, and start executing. If not, consult the user.
+
+Use your judgment. Simple, well-scoped tasks can skip straight to execution. Complex or ambiguous ones deserve a brief back-and-forth. Either way, don't waste iterations — get to work as soon as you're confident.
+
+## Creating a plan
+
+When you determine a plan is needed:
 1. Explore the codebase to understand the relevant code and scope
 2. Write a plan to `.opencode/plans/ralph-plan.md` with: goal, approach, key files, and risks
 3. Call `todowrite` to create the structured task list
 4. Initialize `.opencode/plans/progress.txt` with the CWD and initial state
 5. Begin working on the first task
-
-If there are genuine ambiguities, ask 1-2 focused questions. Otherwise, propose your best plan and start executing.
 
 ## Progress log
 
@@ -32,7 +40,7 @@ Maintain `.opencode/plans/progress.txt` — update it each iteration. Keep it **
 
 Overwrite stale entries. This is a living snapshot, not an append-only log.
 
-## Subsequent iterations
+## Working through tasks
 
 - Read the task list and progress log to determine what to work on next
 - Read relevant files to understand current state
